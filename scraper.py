@@ -75,6 +75,9 @@ REQUEST_TIMEOUT = 20
 MAX_NEW_PER_RUN = int(os.getenv("KP_MAX_NEW_PER_RUN", "120"))
 # Print the phone-number GET status for the first few calls (debugging).
 PHONE_DEBUG_FIRST = int(os.getenv("KP_PHONE_DEBUG_FIRST", "3"))
+# x-kp-signature appears constant per frontend build. Overridable via env so you
+# can update it without a code change if KP ships a new bundle.
+KP_SIGNATURE = os.getenv("KP_SIGNATURE", "fc84b58f982f40d2f35e25e44ce580fda8ff6709")
 
 
 # ── Data model ─────────────────────────────────────────────────────────────────
@@ -242,10 +245,10 @@ class KPScraper:
 
     # ── Detail-page enrichment (name + phone), both null-safe ───────────────────
 
-    def _api_headers(self, referer):
+    def _api_headers(self, referer, auth_token=None):
         h = {
             "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "application/json",
+            "Accept": "application/json, text/plain, */*",
             "Accept-Language": "sr-RS,sr;q=0.9,en-US;q=0.8,en;q=0.7",
             "Content-Type": "application/json",
             "X-Requested-With": "XMLHttpRequest",
@@ -261,37 +264,48 @@ class KPScraper:
             h["x-kp-machine-id"] = mid
         if sess:
             h["x-kp-session"] = sess
+        h["x-kp-channel"] = "desktop_react"
+        h["x-kp-theme"] = "system"
+        h["x-kp-dark"] = "true"
+        if KP_SIGNATURE:
+            h["x-kp-signature"] = KP_SIGNATURE
+        # auth_token is accepted for completeness but incognito works without it.
+        if auth_token:
+            h["authorization"] = auth_token
         return h
 
     def fetch_detail(self, detail_url):
-        """Return (seller_name, owner_id, category_id, group_id) by reading the
-        page's embedded __NEXT_DATA__ JSON. Falls back to the username span."""
+        """Return (seller_name, owner_id, category_id, group_id, auth_token) by
+        reading the page's embedded __NEXT_DATA__ JSON. Falls back to the span."""
         soup = self.fetch_html(detail_url)
         if not soup:
-            return None, None, None, None
+            return None, None, None, None, None
         script = soup.select_one("script#__NEXT_DATA__")
         if script and script.string:
             try:
                 data = json.loads(script.string)
-                ad_by_id = data["props"]["initialReduxState"]["ad"]["byId"]
+                state = data["props"]["initialReduxState"]
+                ad_by_id = state["ad"]["byId"]
                 ad = next(iter(ad_by_id.values()))   # the single ad on the page
                 name = ad.get("ownerName") or (ad.get("user") or {}).get("username")
+                token = (state.get("auth") or {}).get("token")
                 return (name or None,
                         ad.get("userId"),
                         ad.get("categoryId"),
-                        ad.get("groupId"))
+                        ad.get("groupId"),
+                        token or None)
             except (ValueError, KeyError, StopIteration):
                 pass
         # Fallback: seller name from the visible span (phone params unavailable).
         el = soup.select_one("[class*='userName']")
-        return (self._text(el), None, None, None)
+        return (self._text(el), None, None, None, None)
 
-    def fetch_phone(self, ad_id, owner_id, category_id, group_id, referer):
+    def fetch_phone(self, ad_id, owner_id, category_id, group_id, referer, auth_token=None):
         """KP requires a click-log POST before the number is served. Null-safe."""
         if not all([owner_id, category_id, group_id]):
             return None
         try:
-            headers = self._api_headers(referer)
+            headers = self._api_headers(referer, auth_token)
             # 1. Log the phone-button click (this unlocks the number).
             self.session.post(
                 BASE_URL + "/api/web/v1/log/click-phone-button",
@@ -321,9 +335,10 @@ class KPScraper:
     def enrich(self, listings):
         total = len(listings)
         for i, lst in enumerate(listings, 1):
-            name, owner_id, cat_id, grp_id = self.fetch_detail(lst.url)
+            name, owner_id, cat_id, grp_id, token = self.fetch_detail(lst.url)
             lst.seller = name
-            lst.phone  = self.fetch_phone(lst.ad_id, owner_id, cat_id, grp_id, lst.url)
+            lst.phone  = self.fetch_phone(lst.ad_id, owner_id, cat_id, grp_id,
+                                          lst.url, token)
             print(f"  enrich {i}/{total}  id={lst.ad_id}  "
                   f"seller={lst.seller or '—'}  phone={lst.phone or '—'}")
             if i < total:
