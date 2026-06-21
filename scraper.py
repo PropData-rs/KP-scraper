@@ -103,9 +103,9 @@ COLUMNS = [f.name for f in fields(Listing)]
 class KPScraper:
     def __init__(self):
         self.session = requests.Session()
-        # Stable per-run identifier KP expects on the phone endpoints.
-        self.machine_id = uuid.uuid4().hex
         self._phone_debug_left = PHONE_DEBUG_FIRST
+        # KP sets these cookies on first contact; we echo them into x-kp-* headers.
+        self._warmed_up = False
 
     def _headers(self):
         return {
@@ -114,6 +114,23 @@ class KPScraper:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Referer": BASE_URL,
         }
+
+    def warm_up(self):
+        """Hit the homepage once so the server issues machine_id / session
+        cookies, which the phone API requires."""
+        try:
+            self.session.get(BASE_URL + "/", headers={
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept-Language": "sr-RS,sr;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }, timeout=REQUEST_TIMEOUT)
+            self._warmed_up = True
+            mid = self.session.cookies.get("machine_id")
+            sess = self.session.cookies.get("KUPUJEMPRODAJEM")
+            print(f"  warm-up: machine_id={'set' if mid else 'MISSING'} "
+                  f"session={'set' if sess else 'MISSING'}")
+        except requests.RequestException as e:
+            print(f"  [!] warm-up failed: {e}", file=sys.stderr)
 
     def fetch_html(self, url):
         try:
@@ -234,12 +251,14 @@ class KPScraper:
             "X-Requested-With": "XMLHttpRequest",
             "Referer": referer,
             "Origin": BASE_URL,
-            "x-kp-machine-id": self.machine_id,
         }
-        # Mirror a session id from cookies into the header KP expects, if present.
-        sess = (self.session.cookies.get("kp_session")
-                or self.session.cookies.get("x-kp-session")
-                or self.session.cookies.get("PHPSESSID"))
+        # KP maps these cookies → headers:
+        #   machine_id      → x-kp-machine-id
+        #   KUPUJEMPRODAJEM → x-kp-session
+        mid  = self.session.cookies.get("machine_id")
+        sess = self.session.cookies.get("KUPUJEMPRODAJEM")
+        if mid:
+            h["x-kp-machine-id"] = mid
         if sess:
             h["x-kp-session"] = sess
         return h
@@ -357,6 +376,7 @@ def main():
     print(f"Cap this run: {MAX_NEW_PER_RUN} new listings\n")
 
     scraper = KPScraper()
+    scraper.warm_up()   # collect machine_id / session cookies for the phone API
 
     # Ask the sheet which ad_ids already exist (so we skip them everywhere).
     existing = get_existing_ids()
