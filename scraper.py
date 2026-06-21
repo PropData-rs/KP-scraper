@@ -18,6 +18,7 @@ import random
 import re
 import sys
 import time
+import uuid
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime, timezone
 from typing import Optional
@@ -69,6 +70,12 @@ DELAY_LIST_MIN,   DELAY_LIST_MAX   = 2.0, 5.0   # between the 20 list pages
 DELAY_DETAIL_MIN, DELAY_DETAIL_MAX = 1.0, 3.0   # between detail-page fetches
 REQUEST_TIMEOUT = 20
 
+# Cap how many NEW listings to enrich+send per run, so a big first-run backlog
+# is drained over several runs instead of hitting the workflow timeout.
+MAX_NEW_PER_RUN = int(os.getenv("KP_MAX_NEW_PER_RUN", "120"))
+# Print the phone-number GET status for the first few calls (debugging).
+PHONE_DEBUG_FIRST = int(os.getenv("KP_PHONE_DEBUG_FIRST", "3"))
+
 
 # ── Data model ─────────────────────────────────────────────────────────────────
 
@@ -96,6 +103,9 @@ COLUMNS = [f.name for f in fields(Listing)]
 class KPScraper:
     def __init__(self):
         self.session = requests.Session()
+        # Stable per-run identifier KP expects on the phone endpoints.
+        self.machine_id = uuid.uuid4().hex
+        self._phone_debug_left = PHONE_DEBUG_FIRST
 
     def _headers(self):
         return {
@@ -197,50 +207,104 @@ class KPScraper:
                 out.append(lst)
         return out
 
-    def scrape_all_lists(self, ts):
-        all_listings, seen_ids = [], set()
+    def iter_list_pages(self, ts, seen_ids):
+        """Yield (page_index, listings) for each of the 20 list pages, skipping
+        ad_ids already seen this run."""
         for i, url in enumerate(LIST_URLS, 1):
             print(f"[{i}/{len(LIST_URLS)}] {url}")
+            page_listings = []
             soup = self.fetch_html(url)
             if soup:
                 for lst in self.parse_list_page(soup, ts):
-                    if lst.ad_id not in seen_ids:   # de-dup within this run
+                    if lst.ad_id not in seen_ids:
                         seen_ids.add(lst.ad_id)
-                        all_listings.append(lst)
+                        page_listings.append(lst)
+            yield i, page_listings
             if i < len(LIST_URLS):
                 time.sleep(random.uniform(DELAY_LIST_MIN, DELAY_LIST_MAX))
-        return all_listings
 
     # ── Detail-page enrichment (name + phone), both null-safe ───────────────────
 
-    def fetch_seller_name(self, detail_url):
+    def _api_headers(self, referer):
+        h = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "application/json",
+            "Accept-Language": "sr-RS,sr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": referer,
+            "Origin": BASE_URL,
+            "x-kp-machine-id": self.machine_id,
+        }
+        # Mirror a session id from cookies into the header KP expects, if present.
+        sess = (self.session.cookies.get("kp_session")
+                or self.session.cookies.get("x-kp-session")
+                or self.session.cookies.get("PHPSESSID"))
+        if sess:
+            h["x-kp-session"] = sess
+        return h
+
+    def fetch_detail(self, detail_url):
+        """Return (seller_name, owner_id, category_id, group_id) by reading the
+        page's embedded __NEXT_DATA__ JSON. Falls back to the username span."""
         soup = self.fetch_html(detail_url)
         if not soup:
-            return None
+            return None, None, None, None
+        script = soup.select_one("script#__NEXT_DATA__")
+        if script and script.string:
+            try:
+                data = json.loads(script.string)
+                ad_by_id = data["props"]["initialReduxState"]["ad"]["byId"]
+                ad = next(iter(ad_by_id.values()))   # the single ad on the page
+                name = ad.get("ownerName") or (ad.get("user") or {}).get("username")
+                return (name or None,
+                        ad.get("userId"),
+                        ad.get("categoryId"),
+                        ad.get("groupId"))
+            except (ValueError, KeyError, StopIteration):
+                pass
+        # Fallback: seller name from the visible span (phone params unavailable).
         el = soup.select_one("[class*='userName']")
-        name = self._text(el)
-        return name or None
+        return (self._text(el), None, None, None)
 
-    def fetch_phone(self, ad_id):
+    def fetch_phone(self, ad_id, owner_id, category_id, group_id, referer):
+        """KP requires a click-log POST before the number is served. Null-safe."""
+        if not all([owner_id, category_id, group_id]):
+            return None
         try:
-            headers = self._headers()
-            headers["Accept"] = "application/json"
-            headers["X-Requested-With"] = "XMLHttpRequest"
+            headers = self._api_headers(referer)
+            # 1. Log the phone-button click (this unlocks the number).
+            self.session.post(
+                BASE_URL + "/api/web/v1/log/click-phone-button",
+                json={
+                    "adId": int(ad_id),
+                    "ownerId": int(owner_id),
+                    "categoryId": int(category_id),
+                    "groupId": int(group_id),
+                },
+                headers=headers, timeout=REQUEST_TIMEOUT,
+            )
+            # 2. Fetch the number.
             r = self.session.get(PHONE_API.format(ad_id=ad_id),
                                  headers=headers, timeout=REQUEST_TIMEOUT)
+            if self._phone_debug_left > 0:
+                self._phone_debug_left -= 1
+                snippet = r.text[:160].replace("\n", " ")
+                print(f"    [phone-debug] ad={ad_id} status={r.status_code} body={snippet}")
             if r.status_code != 200:
                 return None
             data  = r.json()
-            phone = data.get("phone") or ""
-            return phone.strip() or None
+            phone = (data.get("phone") or "").strip()
+            return phone or None
         except (requests.RequestException, ValueError):
             return None
 
     def enrich(self, listings):
         total = len(listings)
         for i, lst in enumerate(listings, 1):
-            lst.seller = self.fetch_seller_name(lst.url)
-            lst.phone  = self.fetch_phone(lst.ad_id)
+            name, owner_id, cat_id, grp_id = self.fetch_detail(lst.url)
+            lst.seller = name
+            lst.phone  = self.fetch_phone(lst.ad_id, owner_id, cat_id, grp_id, lst.url)
             print(f"  enrich {i}/{total}  id={lst.ad_id}  "
                   f"seller={lst.seller or '—'}  phone={lst.phone or '—'}")
             if i < total:
@@ -283,34 +347,59 @@ def get_existing_ids():
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
+    sheet_id_present = bool(os.environ.get("WEBAPP_URL"))
+    if not sheet_id_present:
+        print("WEBAPP_URL not set – exiting.")
+        return
+
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"\nKP scraper run @ {ts}\n")
+    print(f"\nKP scraper run @ {ts}")
+    print(f"Cap this run: {MAX_NEW_PER_RUN} new listings\n")
 
     scraper = KPScraper()
 
-    # 1. Collect listings from all 20 list pages (Vlasnik-only, deduped per run).
-    listings = scraper.scrape_all_lists(ts)
-    print(f"\nCollected {len(listings)} Vlasnik listings from list pages.")
-    if not listings:
-        print("Nothing collected – exiting.")
-        return
-
-    # 2. Ask the sheet which ad_ids it already has.
+    # Ask the sheet which ad_ids already exist (so we skip them everywhere).
     existing = get_existing_ids()
-    new = [l for l in listings if l.ad_id not in existing]
-    print(f"New: {len(new)}   Already in sheet: {len(listings) - len(new)}\n")
-    if not new:
-        print("No new listings – exiting.")
-        return
+    print(f"Sheet already has {len(existing)} listings.\n")
 
-    # 3. Enrich ONLY the new ones with seller name + phone.
-    print("Fetching seller name + phone for new listings…")
-    scraper.enrich(new)
+    seen_ids = set()
+    sent_total = 0
+    enriched_total = 0
+    stop = False
 
-    # 4. Send to the sheet via the Web App.
-    resp = post_to_webapp(new)
-    print(f"\nWeb App response: {resp}")
-    print("Done.")
+    # Walk the 20 list pages. After each page, enrich the new listings from that
+    # page and POST them immediately. This means a timeout never loses progress —
+    # whatever was already sent stays in the sheet, and the next run resumes.
+    for page_idx, page_listings in scraper.iter_list_pages(ts, seen_ids):
+        new = [l for l in page_listings if l.ad_id not in existing]
+        if not new:
+            continue
+
+        # Respect the per-run cap.
+        room = MAX_NEW_PER_RUN - enriched_total
+        if room <= 0:
+            print(f"\nReached per-run cap ({MAX_NEW_PER_RUN}); stopping early. "
+                  f"Remaining new listings will be picked up next run.")
+            stop = True
+            break
+        if len(new) > room:
+            new = new[:room]
+
+        print(f"  Page {page_idx}: {len(new)} new → enriching…")
+        scraper.enrich(new)
+        enriched_total += len(new)
+
+        resp = post_to_webapp(new)
+        added = resp.get("added", "?") if isinstance(resp, dict) else "?"
+        sent_total += len(new)
+        # Mark as existing so later pages in THIS run don't duplicate them.
+        for l in new:
+            existing.add(l.ad_id)
+        print(f"  Page {page_idx}: sent {len(new)} (sheet added={added}); "
+              f"run total sent={sent_total}\n")
+
+    print(f"\nDone. Enriched {enriched_total}, sent {sent_total} new listings."
+          + ("  (cap hit — run again to continue)" if stop else ""))
 
 
 if __name__ == "__main__":
