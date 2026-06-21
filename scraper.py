@@ -96,6 +96,11 @@ class Listing:
     posted:     Optional[str]
     seller:     Optional[str]  # from detail page (null-safe)
     phone:      Optional[str]  # from phone API   (null-safe)
+    phone_in_text: Optional[str]  # phone mined from the description text (free)
+    city:       Optional[str]  # realEstateLocation city, e.g. "Niš"
+    area_loc:   Optional[str]  # realEstateLocation area, e.g. "Pantelej"
+    neighborhood: Optional[str]  # realEstateLocation place, e.g. "Durlan"
+    description: Optional[str]  # full ad text from detail page
     url:        str
 
 COLUMNS = [f.name for f in fields(Listing)]
@@ -204,6 +209,11 @@ class KPScraper:
                 posted     = posted,
                 seller     = None,     # filled later from detail page
                 phone      = None,     # filled later from API
+                phone_in_text = None,  # filled later from description
+                city       = None,     # filled later from detail page
+                area_loc   = None,
+                neighborhood = None,
+                description = None,
                 url        = url,
             )
         except Exception as e:
@@ -274,31 +284,66 @@ class KPScraper:
             h["authorization"] = auth_token
         return h
 
+    @staticmethod
+    def _mine_phone(text):
+        """Best-effort extraction of a Serbian phone number from free text.
+        Returns the first plausible match, normalized, or None."""
+        if not text:
+            return None
+        # Strip spaces/dots/slashes/dashes between digits so "064 / 123-456" matches.
+        compact = re.sub(r"(?<=\d)[\s./\-](?=\d)", "", text)
+        # Serbian mobiles: 06x + 6-8 digits, or +381/00381 6x...
+        patterns = [
+            r"\+381\s?6\d{7,8}",
+            r"00381\s?6\d{7,8}",
+            r"\b06\d{7,8}\b",
+            r"\b06\d/\d{6,7}\b",
+        ]
+        for pat in patterns:
+            m = re.search(pat, compact)
+            if m:
+                return m.group(0)
+        return None
+
     def fetch_detail(self, detail_url):
-        """Return (seller_name, owner_id, category_id, group_id, auth_token) by
-        reading the page's embedded __NEXT_DATA__ JSON. Falls back to the span."""
+        """Return a dict with seller name, the phone-API params + auth token, the
+        broken-out location, the description, and any phone mined from the text.
+        Reads the page's embedded __NEXT_DATA__ JSON; falls back to the span."""
+        out = {
+            "seller": None, "owner_id": None, "category_id": None,
+            "group_id": None, "token": None, "city": None, "area_loc": None,
+            "neighborhood": None, "description": None, "phone_in_text": None,
+        }
         soup = self.fetch_html(detail_url)
         if not soup:
-            return None, None, None, None, None
+            return out
         script = soup.select_one("script#__NEXT_DATA__")
         if script and script.string:
             try:
                 data = json.loads(script.string)
                 state = data["props"]["initialReduxState"]
-                ad_by_id = state["ad"]["byId"]
-                ad = next(iter(ad_by_id.values()))   # the single ad on the page
-                name = ad.get("ownerName") or (ad.get("user") or {}).get("username")
-                token = (state.get("auth") or {}).get("token")
-                return (name or None,
-                        ad.get("userId"),
-                        ad.get("categoryId"),
-                        ad.get("groupId"),
-                        token or None)
+                ad = next(iter(state["ad"]["byId"].values()))  # single ad on page
+                out["seller"] = (ad.get("ownerName")
+                                 or (ad.get("user") or {}).get("username") or None)
+                out["owner_id"]    = ad.get("userId")
+                out["category_id"] = ad.get("categoryId")
+                out["group_id"]    = ad.get("groupId")
+                out["token"]       = (state.get("auth") or {}).get("token") or None
+                out["description"] = (ad.get("description") or "").strip() or None
+                # Broken-out location: city / area / neighborhood.
+                loc = ad.get("realEstateLocation") or {}
+                out["city"]         = (loc.get("realEstateLocationCity")  or {}).get("name")
+                out["area_loc"]     = (loc.get("realEstateLocationArea")  or {}).get("name")
+                out["neighborhood"] = (loc.get("realEstateLocationPlace") or {}).get("name")
+                # Free phone: mine the description text.
+                out["phone_in_text"] = self._mine_phone(out["description"])
+                return out
             except (ValueError, KeyError, StopIteration):
                 pass
-        # Fallback: seller name from the visible span (phone params unavailable).
+        # Fallback: seller name only.
         el = soup.select_one("[class*='userName']")
-        return (self._text(el), None, None, None, None)
+        out["seller"] = self._text(el)
+        return out
 
     def fetch_phone(self, ad_id, owner_id, category_id, group_id, referer, auth_token=None):
         """KP requires a click-log POST before the number is served. Null-safe."""
@@ -335,12 +380,21 @@ class KPScraper:
     def enrich(self, listings):
         total = len(listings)
         for i, lst in enumerate(listings, 1):
-            name, owner_id, cat_id, grp_id, token = self.fetch_detail(lst.url)
-            lst.seller = name
-            lst.phone  = self.fetch_phone(lst.ad_id, owner_id, cat_id, grp_id,
-                                          lst.url, token)
-            print(f"  enrich {i}/{total}  id={lst.ad_id}  "
-                  f"seller={lst.seller or '—'}  phone={lst.phone or '—'}")
+            d = self.fetch_detail(lst.url)
+            lst.seller       = d["seller"]
+            lst.city         = d["city"]
+            lst.area_loc     = d["area_loc"]
+            lst.neighborhood = d["neighborhood"]
+            lst.description  = d["description"]
+            lst.phone_in_text = d["phone_in_text"]
+            # Try the phone API (signature-gated; may return None).
+            lst.phone = self.fetch_phone(lst.ad_id, d["owner_id"], d["category_id"],
+                                         d["group_id"], lst.url, d["token"])
+            # Prefer API phone; fall back to one mined from the description.
+            best_phone = lst.phone or lst.phone_in_text or "—"
+            loc = " / ".join(x for x in [lst.city, lst.area_loc, lst.neighborhood] if x)
+            print(f"  enrich {i}/{total}  id={lst.ad_id}  seller={lst.seller or '—'}  "
+                  f"phone={best_phone}  loc={loc or '—'}")
             if i < total:
                 time.sleep(random.uniform(DELAY_DETAIL_MIN, DELAY_DETAIL_MAX))
         return listings
