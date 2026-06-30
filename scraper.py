@@ -69,6 +69,9 @@ SCOPES     = ["https://www.googleapis.com/auth/spreadsheets"]
 DELAY_LIST_MIN,   DELAY_LIST_MAX   = 2.0, 5.0   # between the 20 list pages
 DELAY_DETAIL_MIN, DELAY_DETAIL_MAX = 1.0, 3.0   # between detail-page fetches
 REQUEST_TIMEOUT = 20
+# The Apps Script Web App scans the whole sheet to dedupe, so its POST can be
+# slow when the sheet is large. Give it a longer, separate timeout.
+WEBAPP_POST_TIMEOUT = int(os.getenv("KP_WEBAPP_TIMEOUT", "60"))
 
 # Cap how many NEW listings to enrich+send per run, so a big first-run backlog
 # is drained over several runs instead of hitting the workflow timeout.
@@ -404,18 +407,31 @@ class KPScraper:
 
 def post_to_webapp(listings):
     """POST new rows to the Apps Script Web App. The script does the append
-    and de-duplication on the sheet side. Returns the parsed JSON response."""
+    and de-duplication on the sheet side. Retries on slow/failed responses so a
+    single slow call (common when the sheet is large) never kills the run."""
     url = os.environ["WEBAPP_URL"]
     payload = {
         "columns": COLUMNS,
         "rows": [[("" if v is None else v) for v in asdict(l).values()] for l in listings],
     }
-    r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    try:
-        return r.json()
-    except ValueError:
-        return {"raw": r.text}
+    last_err = None
+    for attempt in range(1, 4):   # up to 3 tries
+        try:
+            r = requests.post(url, json=payload, timeout=WEBAPP_POST_TIMEOUT)
+            r.raise_for_status()
+            try:
+                return r.json()
+            except ValueError:
+                return {"raw": r.text}
+        except requests.RequestException as e:
+            last_err = e
+            print(f"  [!] Web App POST attempt {attempt}/3 failed ({e}); retrying…",
+                  file=sys.stderr)
+            time.sleep(3 * attempt)
+    # All retries failed: log and skip this batch instead of crashing the run.
+    print(f"  [!] Web App POST gave up after 3 tries ({last_err}); "
+          f"skipping this batch.", file=sys.stderr)
+    return {"added": 0, "error": str(last_err)}
 
 
 def get_existing_ids():
@@ -423,7 +439,7 @@ def get_existing_ids():
     enrich + send genuinely new listings."""
     url = os.environ["WEBAPP_URL"]
     try:
-        r = requests.get(url, params={"action": "ids"}, timeout=REQUEST_TIMEOUT)
+        r = requests.get(url, params={"action": "ids"}, timeout=WEBAPP_POST_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         return set(str(x) for x in data.get("ids", []))
